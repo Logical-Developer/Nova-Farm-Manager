@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Nova Farm Manager (1.7.10)
+// @name         Nova Farm Manager (1.8.0)
 // @namespace    local.travian.nova.farmmanager
-// @version      1.7.10
+// @version      1.8.0
 // @description  Farm Manager plugin for Nova-HB — dynamic TTL for large runs
 // @match        https://*.travian.com/*
 // @match        https://*.traviantop.com/*
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const FM_VERSION = "1.7.10";
+  const FM_VERSION = "1.8.0";
   const FM_NS = "FarmManager";
   const DRIVER_PLUGIN = "Heartbeat";
   const POLL_MS = 1000;
@@ -962,7 +962,7 @@
     );
     await delay(logNormal(...prof.charDelay));
   }
-  async function humanClickNoNav(el) {
+  async function humanClickNoNav(el, shouldContinue = () => true) {
     if (!el || !el.isConnected) return { ok: false };
     const st = getComputedStyle(el);
     if (st.display === "none" || st.visibility === "hidden")
@@ -970,8 +970,10 @@
     if (el.disabled) return { ok: false };
     const prof = profileSettings();
     await delay(logNormal(...prof.microDelay));
+    if (!shouldContinue()) return { ok: false, cancelled: true };
     el.scrollIntoView({ behavior: "smooth", block: "center" });
     await delay(logNormal(...prof.microDelay));
+    if (!shouldContinue()) return { ok: false, cancelled: true };
     const rect = el.getBoundingClientRect();
     const tx = rect.left + rect.width * (0.25 + Math.random() * 0.5);
     const ty = rect.top + rect.height * (0.25 + Math.random() * 0.5);
@@ -1009,6 +1011,7 @@
         }),
       );
       await delay(logNormal(15, 50));
+      if (!shouldContinue()) return { ok: false, cancelled: true };
     }
     el.dispatchEvent(
       new MouseEvent("mouseover", {
@@ -1027,6 +1030,7 @@
       }),
     );
     await delay(logNormal(...prof.microDelay));
+    if (!shouldContinue()) return { ok: false, cancelled: true };
     el.dispatchEvent(
       new MouseEvent("mousedown", {
         bubbles: true,
@@ -1037,6 +1041,7 @@
       }),
     );
     await delay(logNormal(...prof.charDelay));
+    if (!shouldContinue()) return { ok: false, cancelled: true };
     el.dispatchEvent(
       new MouseEvent("mouseup", {
         bubbles: true,
@@ -1046,6 +1051,7 @@
       }),
     );
     await delay(logNormal(...prof.charDelay));
+    if (!shouldContinue()) return { ok: false, cancelled: true };
     el.click();
     return { ok: true };
   }
@@ -1128,6 +1134,38 @@
   }
   function isCooldownActive() {
     return _cooldownActive;
+  }
+
+  function limitTargetsByAvailableTroops(list, targets, snapshot, pausedRun) {
+    if (!snapshot) return { maxTargets: targets.length, limitingKey: null };
+    const targetIds = new Set(pausedRun?.targetIds || []);
+    const reserved = {};
+    if (pausedRun) {
+      for (const target of list.targets) {
+        if (!targetIds.has(target.id) || target.status !== "sent") continue;
+        if (!target.lastRaid || target.lastRaid.at < (pausedRun.startedAt || 0))
+          continue;
+        if (target.lastRaid.runId && target.lastRaid.runId !== pausedRun.runId)
+          continue;
+        const used = target.troops || pausedRun.troops || list.troops;
+        for (const key of Object.keys(TROOP_LABELS))
+          reserved[key] = (reserved[key] | 0) + (used[key] | 0);
+      }
+    }
+
+    let maxTargets = Infinity;
+    let limitingKey = null;
+    for (const key of Object.keys(TROOP_LABELS)) {
+      const need = list.troops[key] | 0;
+      if (need <= 0) continue;
+      const available = Math.max(0, (snapshot[key] | 0) - (reserved[key] | 0));
+      const canDo = Math.floor(available / need);
+      if (canDo < maxTargets) {
+        maxTargets = canDo;
+        limitingKey = key;
+      }
+    }
+    return { maxTargets: Math.min(targets.length, maxTargets), limitingKey };
   }
 
   function openCooldownModal(durationMs, listName) {
@@ -1337,6 +1375,7 @@
       if (t.id === excludeTargetId) continue;
       if (t.status !== "sent" && t.status !== "partial") continue;
       if (!t.lastRaid || t.lastRaid.at < runStartedAt) continue;
+      if (t.lastRaid.runId && t.lastRaid.runId !== runId) continue;
 
       const usedTroops = t.troops || list.troops;
       for (const [k, v] of Object.entries(usedTroops)) {
@@ -1349,7 +1388,11 @@
 
   function computeTroopsToSend(farm) {
     const bucket = fmState().byVillage[farm.sourceVid];
-    const snapshot = bucket?.snapshot || null;
+    const run = fmState().runInProgress;
+    const snapshot =
+      run?.id === farm.runId
+        ? run.troopSnapshot || bucket?.snapshot || null
+        : bucket?.snapshot || null;
     const want = farm.troops || {};
     const reserved = getReservedInRun(
       farm.runId,
@@ -1410,12 +1453,36 @@
     };
   }
 
+  function savePausedRun(list, run) {
+    const targetIds = [...new Set(run.resumeTargetIds || run.targetIds || [])];
+    const targetIdSet = new Set(targetIds);
+    const hasRemaining = list.targets.some(
+      (target) =>
+        targetIdSet.has(target.id) &&
+        target.status !== "sent" &&
+        target.invalid !== true,
+    );
+    if (!hasRemaining) {
+      list.pausedRun = null;
+      return;
+    }
+    list.pausedRun = {
+      runId: run.id,
+      startedAt: run.startedAt,
+      planned: targetIds.length,
+      targetIds,
+      troopSnapshot: run.troopSnapshot ? { ...run.troopSnapshot } : null,
+      troops: { ...run.troops },
+    };
+  }
+
   // ═════════════════════════════════════════════════════════════
   // ATOMIC RESULT + MAYBE FINISH
   // ═════════════════════════════════════════════════════════════
   function applyResultAndMaybeFinish(farm, status, reason, extra = {}) {
     let reportData = null;
     fmPatch((fm) => {
+      if (!fm.runInProgress || fm.runInProgress.id !== farm.runId) return;
       const b = fm.byVillage[farm.sourceVid];
       if (!b) return;
       const list = b.lists.find((l) => l.id === farm.listId);
@@ -1424,7 +1491,13 @@
       if (!t) return;
 
       t.status = status;
-      t.lastRaid = { at: now(), status, reason: reason || null, ...extra };
+      t.lastRaid = {
+        at: now(),
+        status,
+        reason: reason || null,
+        runId: farm.runId,
+        ...extra,
+      };
       if (extra.partialRemaining) t.partialRemaining = extra.partialRemaining;
       else if (status === "sent") t.partialRemaining = null;
       if (status === "skipped") t.lastSkipReason = reason || "unknown";
@@ -1438,10 +1511,12 @@
           r.skipped += 1;
         }
         r.currentTarget = null;
+        r.currentTargetId = null;
         r.currentState = null;
 
         const done = r.sent + r.failed + r.skipped;
         if (done >= r.planned) {
+          savePausedRun(list, r);
           const elapsedMs = now() - r.startedAt;
           reportData = {
             sent: r.sent,
@@ -1473,6 +1548,7 @@
   function markTargetInvalidAndMaybeFinish(farm, reason) {
     let reportData = null;
     fmPatch((fm) => {
+      if (!fm.runInProgress || fm.runInProgress.id !== farm.runId) return;
       const b = fm.byVillage[farm.sourceVid];
       if (!b) return;
       const list = b.lists.find((l) => l.id === farm.listId);
@@ -1483,16 +1559,23 @@
       t.status = "failed";
       t.invalid = true;
       t.selected = false;
-      t.lastRaid = { at: now(), status: "failed", reason: reason || "invalid" };
+      t.lastRaid = {
+        at: now(),
+        status: "failed",
+        reason: reason || "invalid",
+        runId: farm.runId,
+      };
 
       if (fm.runInProgress && fm.runInProgress.id === farm.runId) {
         const r = fm.runInProgress;
         r.skipped += 1;
         r.currentTarget = null;
+        r.currentTargetId = null;
         r.currentState = null;
 
         const done = r.sent + r.failed + r.skipped;
         if (done >= r.planned) {
+          savePausedRun(list, r);
           const elapsedMs = now() - r.startedAt;
           reportData = {
             sent: r.sent,
@@ -1564,6 +1647,7 @@
 
       if (fm.runInProgress && fm.runInProgress.id === farm.runId) {
         const r = fm.runInProgress;
+        savePausedRun(list, r);
         const elapsedMs = now() - r.startedAt;
         const pendingLeft = r.planned - r.sent - r.failed - r.skipped;
         reportData = {
@@ -1936,7 +2020,7 @@
         </label>
         <div style="margin-top:10px;display:flex;gap:8px;">
           <button type="button" class="fm-map-add" style="flex:1;padding:6px 10px;background:linear-gradient(180deg,#7ab04a,#4a7a30);color:#fff;border:1px solid #2a5a10;border-radius:4px;font-weight:bold;cursor:pointer;font-size:12px;">Add to list</button>
-          <button type="button" class="fm-map-cancel" style="padding:6px 12px;background:#ddd;border:1px solid #999;border-radius:4px;cursor:pointer;font-size:12px;">Cancel</button>
+          <button type="button" class="fm-map-remove" style="padding:6px 12px;background:linear-gradient(180deg,#d04a30,#a03020);color:#fff;border:1px solid #601010;border-radius:4px;cursor:pointer;font-size:12px;" disabled>Remove</button>
         </div>
         <div class="fm-map-msg" style="margin-top:8px;font-size:11px;color:#4a7a30;display:none;"></div>
       </div>
@@ -1969,6 +2053,7 @@
     const heroChk = box.querySelector(".fm-map-hero");
     const msg = box.querySelector(".fm-map-msg");
     const addBtn = box.querySelector(".fm-map-add");
+    const removeBtn = box.querySelector(".fm-map-remove");
 
     function getBucket() {
       return fmState().byVillage[String(srcVid)];
@@ -2030,6 +2115,7 @@
         return;
       }
       const inList = targetInList(l);
+      removeBtn.disabled = !inList;
       let troops, hf;
       if (inList) {
         troops = inList.troops || l.troops;
@@ -2103,11 +2189,29 @@
       refreshListOptions(l.id);
       return false;
     });
-    box.querySelector(".fm-map-cancel").addEventListener("click", (e) => {
+    removeBtn.addEventListener("click", (e) => {
       e.preventDefault();
       e.stopPropagation();
-      box.remove();
-      _fmMapBoxRef = null;
+      const l = currentList();
+      const existing = targetInList(l);
+      if (!existing) return false;
+      if (
+        !confirm(
+          `Remove "${existing.name}" (${existing.x}|${existing.y}) from "${l.name}"?`,
+        )
+      )
+        return false;
+      fmPatch((fm) => {
+        const list = fm.byVillage[String(srcVid)].lists.find(
+          (item) => item.id === l.id,
+        );
+        if (list)
+          list.targets = list.targets.filter((item) => item.id !== existing.id);
+      });
+      msg.style.display = "block";
+      msg.style.color = "#a03020";
+      msg.textContent = `Removed ${existing.name} from ${l.name}`;
+      refreshListOptions(l.id);
       return false;
     });
 
@@ -2210,6 +2314,131 @@
   }
   function shouldShowFarmPanel() {
     return isRallyTt0();
+  }
+
+  function renderRallyRunStatus() {
+    const onRally = isRallyManagement() || isRallyOverview() || isRallySend();
+    let panel = document.getElementById("fm-run-status");
+    if (!onRally) {
+      if (panel) panel.remove();
+      return;
+    }
+    const anchor = document.getElementById("stockBar");
+    if (!anchor) return;
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.id = "fm-run-status";
+      panel.style.cssText =
+        "margin:6px 0;padding:8px 10px;background:linear-gradient(180deg,#f9fbff,#e8eff9);border:2px solid #8a9ac0;border-radius:6px;font-family:Verdana,sans-serif;font-size:12px;color:#1a2050;box-shadow:0 3px 10px rgba(0,0,0,.18);box-sizing:border-box;";
+      anchor.insertAdjacentElement("afterend", panel);
+    } else if (panel.previousElementSibling !== anchor) {
+      anchor.insertAdjacentElement("afterend", panel);
+    }
+
+    const vid = String(window.TC.village() || "");
+    const fm = fmState();
+    const run = fm.runInProgress?.sourceVid === vid ? fm.runInProgress : null;
+    const bucket = fm.byVillage[vid];
+    const paused = (bucket?.lists || []).filter(
+      (list) => list.pausedRun && (!run || list.id !== run.listId),
+    );
+    if (!run && !paused.length) {
+      panel.remove();
+      return;
+    }
+
+    if (run) {
+      const total = Math.max(
+        run.planned || 0,
+        (run.resumeTargetIds || []).length,
+      );
+      const done = (run.sent || 0) + (run.failed || 0) + (run.skipped || 0);
+      const remaining = Math.max(0, total - done);
+      const percent = total
+        ? Math.min(100, Math.round((done / total) * 100))
+        : 0;
+      panel.innerHTML = `<div style="display:flex;align-items:center;gap:12px;"><div style="flex:1;min-width:0;"><div style="font-weight:bold;margin-bottom:3px;">${esc(run.listName)} · ${done}/${total} attacks · ${remaining} remaining</div><div style="height:7px;background:#d0d8e8;border-radius:4px;overflow:hidden;"><div style="width:${percent}%;height:100%;background:linear-gradient(90deg,#7ab04a,#4a7a30);transition:width .3s;"></div></div><div style="font-size:10px;color:#5a6a80;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(run.currentTarget || "Preparing next attack")} · ${run.sent || 0} sent, ${run.failed || 0} failed, ${run.skipped || 0} skipped</div></div><button type="button" class="fm-run-stop" style="flex-shrink:0;padding:8px 14px;background:linear-gradient(180deg,#d04a30,#a03020);color:#fff;border:1px solid #601010;border-radius:5px;font-weight:bold;cursor:pointer;">Stop</button></div>`;
+      panel.querySelector(".fm-run-stop").onclick = pauseActiveRun;
+    }
+
+    if (!paused.length) return;
+    const pausedMarkup =
+      `<div style="font-weight:bold;margin:8px 0 5px;color:#805020;border-top:1px solid rgba(80,110,150,.25);padding-top:7px;">Paused farm lists (${paused.length})</div>` +
+      paused
+        .map((list) => {
+          const saved = list.pausedRun;
+          const targetIds = new Set(saved.targetIds || []);
+          const scoped = list.targets.filter((target) =>
+            targetIds.has(target.id),
+          );
+          const remaining = scoped.filter(
+            (target) => target.status !== "sent" && target.invalid !== true,
+          ).length;
+          const done = scoped.filter((target) =>
+            ["sent", "failed", "skipped"].includes(target.status),
+          ).length;
+          const total = Math.max(saved.planned || 0, scoped.length);
+          const percent = total
+            ? Math.min(100, Math.round((done / total) * 100))
+            : 0;
+          return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-top:1px solid rgba(80,110,150,.25);"><div style="flex:1;min-width:0;"><div style="font-weight:bold;">${esc(list.name)} · ${done}/${total} attacks · ${remaining} remaining</div><div style="height:5px;background:#d0d8e8;border-radius:3px;overflow:hidden;margin-top:4px;"><div style="width:${percent}%;height:100%;background:#7ab04a;"></div></div></div><button type="button" data-fm-resume-list="${esc(list.id)}" ${run ? "disabled" : ""} style="flex-shrink:0;padding:7px 12px;background:linear-gradient(180deg,#d09030,#a06020);color:#fff;border:1px solid #603010;border-radius:4px;font-weight:bold;cursor:${run ? "not-allowed" : "pointer"};opacity:${run ? ".55" : "1"};">Resume</button></div>`;
+        })
+        .join("");
+    if (run) panel.insertAdjacentHTML("beforeend", pausedMarkup);
+    else panel.innerHTML = pausedMarkup;
+    panel.querySelectorAll("[data-fm-resume-list]").forEach((button) => {
+      button.onclick = () => {
+        const farmPanel = document.querySelector(".fm-panel");
+        const tab = Array.from(
+          farmPanel?.querySelectorAll(".fm-tab") || [],
+        ).find((item) => item.dataset.id === button.dataset.fmResumeList);
+        if (!tab) return;
+        tab.click();
+        farmPanel.querySelector(".fm-btn-resume")?.click();
+      };
+    });
+  }
+
+  function pauseActiveRun() {
+    const run = fmState().runInProgress;
+    if (!run) return;
+    const taskState = window.TC.state();
+    const activeFarm = taskState.currentJob?.payload?.farm;
+    const currentTargetId =
+      run.currentTargetId ||
+      (activeFarm?.runId === run.id ? activeFarm.targetId : null);
+    fmPatch((fm) => {
+      const list = fm.byVillage[run.sourceVid]?.lists.find(
+        (item) => item.id === run.listId,
+      );
+      if (list) savePausedRun(list, run);
+      fm.runInProgress = null;
+      fm._pendingFinalReport = null;
+      fm._navigateToTt0AfterRun = false;
+      fm._endOfRunHandled = true;
+      fm._activeRunId = null;
+    });
+    clearPendingRunKey();
+    try {
+      const state = window.TC.state();
+      const taskIds = (state.tasks || [])
+        .filter((task) => task.payload?.farm?.runId === run.id)
+        .map((task) => task.id);
+      taskIds.forEach((id) => window.TC.cancel(id));
+      if (state.currentJob?.payload?.farm?.runId === run.id)
+        window.TC.cancel(state.currentJob.id);
+    } catch (error) {
+      fmLog("WARN", "manual stop task cancellation failed", error);
+    }
+    closeCooldownModal();
+    clearCooldownFreeze();
+    restoreHeartbeatAfterRun();
+    fmLog(
+      "INFO",
+      `Run paused manually: ${run.listName}, target=${currentTargetId || "none"}`,
+    );
+    const url = `/build.php?id=39&gid=16&tt=0&newdid=${run.sourceVid}`;
+    location.replace(url);
   }
 
   function openEditTargetDialog(srcVid, listId, targetId, onSave) {
@@ -2315,6 +2544,79 @@
     dialog.querySelector(".fm-edit-cancel").onclick = () => overlay.remove();
     overlay.onclick = (e) => {
       if (e.target === overlay) overlay.remove();
+    };
+  }
+
+  function openExportModal(srcVid, listId) {
+    const list = fmState().byVillage[String(srcVid)]?.lists.find(
+      (item) => item.id === listId,
+    );
+    if (!list?.targets.length) {
+      alert("Nothing to export");
+      return;
+    }
+
+    const overlay = document.createElement("div");
+    overlay.id = "fm-export-overlay";
+    overlay.style.cssText =
+      "position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:20px;";
+    const modal = document.createElement("div");
+    modal.style.cssText = `background:linear-gradient(180deg,#f9fbff,#e8eff9);border:2px solid #8a9ac0;border-radius:8px;padding:16px;font-family:Verdana,sans-serif;font-size:12px;color:#1a2050;max-width:600px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,.5);max-height:90vh;overflow-y:auto;`;
+    modal.innerHTML = `
+      <div style="font-weight:bold;font-size:16px;color:#2a4a70;text-align:center;margin-bottom:8px;">Export List (v${FM_VERSION})</div>
+      <div style="text-align:center;font-size:12px;margin-bottom:10px;">Formats: <b>JSON</b></div>
+      <div style="margin-bottom:8px;color:#5a6a80;">List: <b>${esc(list.name)}</b></div>
+      <label style="display:block;margin-bottom:8px;"><input type="checkbox" class="fm-export-selected"> Export selected targets only</label>
+      <textarea class="fm-export-json" readonly spellcheck="false" style="width:100%;height:240px;padding:8px;font-family:'Courier New',monospace;font-size:11px;border:1px solid #8a9ac0;border-radius:3px;box-sizing:border-box;resize:vertical;background:#fff;"></textarea>
+      <div style="display:flex;gap:6px;margin-top:10px;">
+        <button type="button" class="fm-export-copy" style="flex:1;padding:8px 12px;background:linear-gradient(180deg,#6a9ee8,#3060b0);color:#fff;border:1px solid #204080;border-radius:4px;font-weight:bold;cursor:pointer;">Copy</button>
+        <button type="button" class="fm-export-download" style="flex:1;padding:8px 12px;background:linear-gradient(180deg,#7ab04a,#4a7a30);color:#fff;border:1px solid #2a5a10;border-radius:4px;font-weight:bold;cursor:pointer;">Download</button>
+        <button type="button" class="fm-export-cancel" style="padding:8px 12px;background:#ddd;border:1px solid #999;border-radius:4px;cursor:pointer;">Cancel</button>
+      </div>
+    `;
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    const selectedOnly = modal.querySelector(".fm-export-selected");
+    const jsonInput = modal.querySelector(".fm-export-json");
+    const updateJson = () => {
+      jsonInput.value =
+        exportListCompact(srcVid, listId, selectedOnly.checked) || "";
+    };
+    selectedOnly.onchange = updateJson;
+    updateJson();
+
+    modal.querySelector(".fm-export-copy").onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(jsonInput.value);
+      } catch (e) {
+        jsonInput.focus();
+        jsonInput.select();
+        if (!document.execCommand("copy")) {
+          showToast("Copy failed", "warn");
+          return;
+        }
+      }
+      showToast("JSON copied", "ok");
+    };
+    modal.querySelector(".fm-export-download").onclick = () => {
+      const blob = new Blob([jsonInput.value], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      const safeName = (list.name || "list").replace(/[^a-z0-9_-]/gi, "_");
+      link.href = url;
+      link.download = `farm-list-${safeName}-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(link);
+      link.click();
+      setTimeout(() => {
+        link.remove();
+        URL.revokeObjectURL(url);
+      }, 100);
+      showToast("JSON downloaded", "ok");
+    };
+    modal.querySelector(".fm-export-cancel").onclick = () => overlay.remove();
+    overlay.onclick = (event) => {
+      if (event.target === overlay) overlay.remove();
     };
   }
 
@@ -3159,9 +3461,10 @@
       );
       const hasPending = allPending.length > 0;
       const hasDone = l.targets.some((t) => t.status === "sent");
+      const hasPausedRun = !!l.pausedRun;
       if (hasPending) {
-        btnStart.style.display = hasDone ? "none" : "block";
-        btnResume.style.display = hasDone ? "block" : "none";
+        btnStart.style.display = hasDone || hasPausedRun ? "none" : "block";
+        btnResume.style.display = hasDone || hasPausedRun ? "block" : "none";
         btnRestart.style.display = hasDone ? "block" : "none";
         btnStart.textContent = `Start Raid (${selected.length})`;
         btnResume.textContent = `Resume (${selected.length} remaining)`;
@@ -3296,27 +3599,7 @@
         alert("Nothing to export");
         return;
       }
-      const onlySel = confirm(
-        "Export only SELECTED targets?\n\nOK = selected only\nCancel = all targets",
-      );
-      const json = exportListCompact(srcVid, l.id, onlySel);
-      if (!json) {
-        alert("Export failed");
-        return;
-      }
-      const blob = new Blob([json], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      const safeName = (l.name || "list").replace(/[^a-z0-9_-]/gi, "_");
-      a.download = `farm-list-${safeName}-${new Date().toISOString().slice(0, 10)}.json`;
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => {
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-      }, 100);
-      window.TC.flash?.(`Exported ${onlySel ? "selected" : "all"} targets`);
+      openExportModal(srcVid, l.id);
     };
 
     btnImport.onclick = () => {
@@ -3465,17 +3748,8 @@
         return;
       }
 
-      let targets;
-      if (mode === "resume") {
-        targets = candidates.filter(
-          (t) =>
-            t.status === "pending" ||
-            t.status === "skipped" ||
-            t.status === "partial",
-        );
-      } else {
-        targets = candidates.filter((t) => t.status !== "sent");
-      }
+      const pausedRun = mode === "resume" ? l.pausedRun : null;
+      let targets = candidates.filter((t) => t.status !== "sent");
       if (!targets.length) {
         alert("Nothing to send");
         return;
@@ -3494,35 +3768,30 @@
         return (a.addedAt || 0) - (b.addedAt || 0);
       });
 
-      if (mode === "start") {
-        const snapshot = fmState().byVillage[String(srcVid)].snapshot;
-        if (snapshot) {
-          const need = {};
-          for (const k of Object.keys(TROOP_LABELS)) {
-            need[k] = l.troops[k] | 0;
-          }
-          let maxByTroop = Infinity;
-          let limitingKey = null;
-          for (const k of Object.keys(need)) {
-            if (need[k] <= 0) continue;
-            const have = snapshot[k] | 0;
-            const canDo = Math.floor(have / need[k]);
-            if (canDo < maxByTroop) {
-              maxByTroop = canDo;
-              limitingKey = k;
-            }
-          }
-          if (maxByTroop < targets.length && maxByTroop >= 0) {
-            const skipped = targets.length - maxByTroop;
-            const limName = limitingKey ? TROOP_LABELS[limitingKey] : "troops";
-            const msg =
-              `Only enough ${limName} for ${maxByTroop} of ${targets.length} targets.\n\n` +
-              `${skipped} targets will remain pending and can be resumed when you have more troops.\n\n` +
-              `Continue with ${maxByTroop} targets?`;
-            if (!confirm(msg)) return;
-            targets = targets.slice(0, maxByTroop);
-          }
-        }
+      const villageBucket = fmState().byVillage[String(srcVid)];
+      const troopSnapshot =
+        pausedRun?.troopSnapshot || villageBucket.snapshot || null;
+      const resumeTargetIds =
+        pausedRun?.targetIds || targets.map((target) => target.id);
+      const { maxTargets, limitingKey } = limitTargetsByAvailableTroops(
+        l,
+        targets,
+        troopSnapshot,
+        pausedRun,
+      );
+      if (maxTargets < targets.length) {
+        const limitedCount = targets.length - maxTargets;
+        const limName = limitingKey ? TROOP_LABELS[limitingKey] : "troops";
+        const msg =
+          `Only enough ${limName} for ${maxTargets} of ${targets.length} remaining targets.\n\n` +
+          `${limitedCount} targets will remain pending and can be resumed later.\n\n` +
+          `Continue with ${maxTargets} targets?`;
+        if (!confirm(msg)) return;
+        targets = targets.slice(0, maxTargets);
+      }
+      if (!targets.length) {
+        alert("No available troops for the remaining targets");
+        return;
       }
 
       const s0 = window.TC.state();
@@ -3532,6 +3801,12 @@
         fm._navigateToTt0AfterRun = false;
         fm._endOfRunHandled = false;
         fm._pendingFinalReport = null;
+        if (mode === "start") {
+          const list = fm.byVillage[String(srcVid)].lists.find(
+            (item) => item.id === l.id,
+          );
+          if (list) list.pausedRun = null;
+        }
       });
 
       if (
@@ -3547,20 +3822,23 @@
         fmLog("INFO", "Heartbeat was ON → will stay ON");
       }
 
-      const runId = uid("run");
+      const runId = pausedRun?.runId || uid("run");
       const runData = {
         id: runId,
         sourceVid: String(srcVid),
         listId: l.id,
         listName: l.name,
-        startedAt: now(),
+        startedAt: pausedRun?.startedAt || now(),
         planned: targets.length,
         sent: 0,
         failed: 0,
         skipped: 0,
         targetIds: targets.map((t) => t.id),
+        resumeTargetIds: [...resumeTargetIds],
         currentTarget: null,
+        currentTargetId: null,
         currentState: "preparing",
+        troopSnapshot: troopSnapshot ? { ...troopSnapshot } : null,
         troops: { ...l.troops },
         heroFollow: l.heroFollow === true,
         autoFill: l.autoFill || "fillAvailable",
@@ -3627,7 +3905,7 @@
   }
 
   // ─────────────────────────────────────────────────────────────
-  // Enqueue / resume — v1.7.10 با TTL پویا
+  // Enqueue / resume — v1.8.0 با TTL پویا
   // ─────────────────────────────────────────────────────────────
   function enqueueRunTasks(runData) {
     let count = 0;
@@ -3870,6 +4148,8 @@
   async function handleFarmArrive({ job, target, payload }) {
     const farm = payload.farm;
     if (!farm) return { type: "fail", reason: "no-farm-payload" };
+    if (fmState().runInProgress?.id !== farm.runId)
+      return { type: "done", reason: "run-paused-or-replaced" };
 
     const u = new URL(location.href);
     const isRallySend =
@@ -3953,11 +4233,14 @@
     fmPatch((fm) => {
       if (fm.runInProgress) {
         fm.runInProgress.currentTarget = farm.targetName;
+        fm.runInProgress.currentTargetId = farm.targetId;
         fm.runInProgress.currentState = "filling";
       }
     });
 
     if (confirmFormExists) {
+      if (fmState().runInProgress?.id !== farm.runId)
+        return { type: "done", reason: "run-paused-before-confirm" };
       const confirmBtn = document.getElementById("confirmSendTroops");
       if (!confirmBtn)
         return { type: "wait", delayMs: 500, reason: "no-confirm-btn" };
@@ -3974,7 +4257,14 @@
         );
       });
 
-      await humanClickNoNav(confirmBtn);
+      const clickResult = await humanClickNoNav(
+        confirmBtn,
+        () =>
+          fmState().runInProgress?.id === farm.runId ||
+          (!!report && !!fmState()._pendingFinalReport),
+      );
+      if (!clickResult.ok)
+        return { type: "done", reason: "run-paused-before-confirm" };
 
       const fmAfter = fmState();
       if (fmAfter._navigateToTt0AfterRun || report || !fmAfter.runInProgress) {
@@ -4030,6 +4320,8 @@
       if (!inp || inp.disabled) continue;
       await humanType(inp, String(plan.troops[k] | 0));
       await humanTabToNext(inp);
+      if (fmState().runInProgress?.id !== farm.runId)
+        return { type: "done", reason: "run-paused-while-filling" };
     }
 
     const xInp = document.getElementById("xCoordInput");
@@ -4045,6 +4337,8 @@
     if (!raidRadio.checked) await humanClickNoNav(raidRadio);
 
     await delay(logNormal(200, 500));
+    if (fmState().runInProgress?.id !== farm.runId)
+      return { type: "done", reason: "run-paused-before-submit" };
     if (
       parseInt(xInp.value, 10) !== farm.x ||
       parseInt(yInp.value, 10) !== farm.y
@@ -4059,7 +4353,12 @@
       if (fm.runInProgress) fm.runInProgress.currentState = "submitting";
     });
     fmLog("INFO", "submitting " + farm.targetName + " → awaiting confirm");
-    await humanClickNoNav(okBtn);
+    const submitResult = await humanClickNoNav(
+      okBtn,
+      () => fmState().runInProgress?.id === farm.runId,
+    );
+    if (!submitResult.ok)
+      return { type: "done", reason: "run-paused-before-submit" };
 
     return { type: "transition", state: "EXECUTING" };
   }
@@ -4310,6 +4609,7 @@
       }
       injectFarmBoxOnMap();
       injectFarmPanel();
+      renderRallyRunStatus();
       checkPendingReport();
       if (isRallyOverview()) captureSnapshot();
       if (isRallySend()) resumeRunIfPending();
