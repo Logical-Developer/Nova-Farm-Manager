@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Nova Farm Manager (1.8.2)
+// @name         Nova Farm Manager (1.8.3)
 // @namespace    local.travian.nova.farmmanager
-// @version      1.8.2
-// @description  Farm Manager plugin for Nova-HB — dynamic TTL for large runs
+// @version      1.8.3
+// @description  Farm Manager plugin for Nova-HB — fixed stuck-on-send-troops bug + orphaned task cleanup
 // @match        https://*.travian.com/*
 // @match        https://*.traviantop.com/*
 // @match        https://*.international.travian.com/*
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const FM_VERSION = "1.8.2";
+  const FM_VERSION = "1.8.3";
   const FM_NS = "FarmManager";
   const DRIVER_PLUGIN = "Heartbeat";
   const POLL_MS = 1000;
@@ -29,12 +29,20 @@
   const TTL_PER_TASK_MS = 45 * 1000; // 45 ثانیه per task
   const ROTATION_PER_TASK_MS = 60 * 1000; // 60 ثانیه per task برای rotation
   const ROTATION_EXTRA_MS = 120 * 1000; // 2 دقیقه اضافه
+  const ROTATION_MAX_MS = 6 * 60 * 60 * 1000; // ⭐ سقف 6 ساعت
 
   // ─────────────────────────────────────────────────────────────
-  // Log Buffer
+  // Log Buffer (بهینه‌شده: dedupe + sample rate)
   // ─────────────────────────────────────────────────────────────
-  const LOG_BUFFER_MAX = 200;
+  const LOG_BUFFER_MAX = 300;
   const _logBuffer = [];
+  const _logDedupMap = new Map(); // key → {count, lastTs}
+  const LOG_DEDUP_WINDOW_MS = 5000; // 5 ثانیه
+
+  function _logKey(level, msg) {
+    // پیام را نرمالایز کن (اعداد را حذف کن برای dedup)
+    return level + "|" + msg.replace(/\d+/g, "#").slice(0, 120);
+  }
 
   function fmLog(level, ...args) {
     const ts = new Date().toISOString().slice(11, 23);
@@ -51,6 +59,23 @@
         return String(a);
       })
       .join(" ");
+
+    // ⭐ Dedupe: پیام‌های تکراری در بازه 5 ثانیه فقط یک بار لاگ می‌شوند
+    const key = _logKey(level, msg);
+    const nowMs = Date.now();
+    const prev = _logDedupMap.get(key);
+    if (prev && nowMs - prev.lastTs < LOG_DEDUP_WINDOW_MS) {
+      prev.count++;
+      prev.lastTs = nowMs;
+      // به‌روزرسانی آخرین خط لاگ به جای اضافه کردن خط جدید
+      const lastIdx = _logBuffer.length - 1;
+      if (lastIdx >= 0 && _logBuffer[lastIdx].includes(msg.slice(0, 80))) {
+        _logBuffer[lastIdx] = `[${ts}] [${level}] ${msg} (×${prev.count})`;
+      }
+      return;
+    }
+    _logDedupMap.set(key, { count: 1, lastTs: nowMs });
+
     const line = `[${ts}] [${level}] ${msg}`;
     _logBuffer.push(line);
     if (_logBuffer.length > LOG_BUFFER_MAX) _logBuffer.shift();
@@ -66,6 +91,7 @@
   function clearLogBuffer() {
     const n = _logBuffer.length;
     _logBuffer.length = 0;
+    _logDedupMap.clear();
     showToast("Log cleared (" + n + " lines)", "ok");
     fmLog("INFO", "Log buffer cleared by user");
     if (_fmPanelRef && _fmPanelRef.isConnected) {
@@ -101,8 +127,18 @@
             version: s._version,
             settings: s.settings,
             villages: Object.keys(s.byVillage || {}),
-            currentVillageBucket:
-              s.byVillage?.[String(window.TC?.village?.())] || null,
+            currentVillageBucket: s.byVillage?.[String(window.TC?.village?.())]
+              ? {
+                  lists: s.byVillage[String(window.TC.village())].lists.map(
+                    (l) => ({
+                      id: l.id,
+                      name: l.name,
+                      targets: l.targets.length,
+                      pausedRun: l.pausedRun ? "(set)" : null,
+                    }),
+                  ),
+                }
+              : null,
             runInProgress: s.runInProgress,
             pendingFinalReport: s._pendingFinalReport ? "(set)" : null,
             navigateToTt0AfterRun: s._navigateToTt0AfterRun,
@@ -122,13 +158,21 @@
         JSON.stringify(
           {
             heartbeat: ns?.heartbeat,
-            currentJob: ns?.currentJob,
-            tasks: (ns?.tasks || []).map((t) => ({
-              id: t.id,
-              plugin: t.plugin,
-              state: t.state,
-              farm: t.payload?.farm || null,
-            })),
+            currentJob: ns?.currentJob
+              ? `${ns.currentJob.plugin}/${ns.currentJob.state}`
+              : null,
+            totalTasks: (ns?.tasks || []).length,
+            farmTasks: (ns?.tasks || []).filter((t) => t.payload?.farm).length,
+            farmTaskSample: (ns?.tasks || [])
+              .filter((t) => t.payload?.farm)
+              .slice(0, 5)
+              .map((t) => ({
+                id: t.id,
+                state: t.state,
+                runId: t.payload?.farm?.runId,
+                target: t.payload?.farm?.targetName,
+                expiresAt: t.expiresAt,
+              })),
           },
           null,
           2,
@@ -233,6 +277,12 @@
     try {
       sessionStorage.removeItem(PENDING_RUN_KEY);
     } catch (e) {}
+  }
+
+  // ⭐ محدود کردن nextRotationAt به بازه معقول
+  function safeRotationAt(targetMs) {
+    const maxAllowed = now() + ROTATION_MAX_MS;
+    return Math.min(Math.max(targetMs, now() + 1000), maxAllowed);
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -1293,6 +1343,35 @@
     }
   }
 
+  // ⭐ جدید: پاک‌سازی تسک‌های farm یتیم (orphaned)
+  function cancelOrphanedFarmTasks() {
+    try {
+      const s = window.TC.state();
+      const fm = fmState();
+      const activeRunId = fm._activeRunId;
+      const tasks = s.tasks || [];
+      let cancelled = 0;
+      for (const t of tasks) {
+        const f = t.payload?.farm;
+        if (!f) continue;
+        // اگر runId با run فعال مطابقت ندارد یا run فعالی وجود ندارد → orphaned
+        if (!activeRunId || f.runId !== activeRunId) {
+          try {
+            window.TC.cancel(t.id);
+            cancelled++;
+          } catch (e) {}
+        }
+      }
+      if (cancelled > 0) {
+        fmLog("INFO", `Cancelled ${cancelled} orphaned farm task(s)`);
+      }
+      return cancelled;
+    } catch (e) {
+      fmLog("WARN", "cancelOrphanedFarmTasks failed", e);
+      return 0;
+    }
+  }
+
   function cancelCurrentRun() {
     clearPendingRunKey();
     fmPatch((fm) => {
@@ -1303,6 +1382,7 @@
       fm._endOfRunHandled = true;
       fm._activeRunId = null;
     });
+    // ⭐ cancel تمام تسک‌های farm (نه فقط run فعال)
     try {
       const s = window.TC.state();
       const ids = (s.tasks || [])
@@ -1310,6 +1390,7 @@
         .map((t) => t.id);
       ids.forEach((id) => window.TC.cancel(id));
       if (s.currentJob?.payload?.farm) window.TC.cancel(s.currentJob.id);
+      fmLog("INFO", `Cancelled ${ids.length} farm task(s) on cancelCurrentRun`);
     } catch (e) {
       fmLog("WARN", "cancel tasks failed", e);
     }
@@ -1481,6 +1562,7 @@
   // ═════════════════════════════════════════════════════════════
   function applyResultAndMaybeFinish(farm, status, reason, extra = {}) {
     let reportData = null;
+    let runFinished = false;
     fmPatch((fm) => {
       if (!fm.runInProgress || fm.runInProgress.id !== farm.runId) return;
       const b = fm.byVillage[farm.sourceVid];
@@ -1533,11 +1615,14 @@
           fm._navigateToTt0AfterRun = true;
           fm._endOfRunHandled = true;
           fm._activeRunId = null;
+          runFinished = true;
         }
       }
     });
 
-    if (reportData) {
+    // ⭐ اگر run تمام شد، تسک‌های باقی‌مانده را cancel کن
+    if (runFinished) {
+      cancelOrphanedFarmTasks();
       clearPendingRunKey();
       restoreHeartbeatAfterRun();
       fmLog("INFO", "Run complete", reportData);
@@ -1547,6 +1632,7 @@
 
   function markTargetInvalidAndMaybeFinish(farm, reason) {
     let reportData = null;
+    let runFinished = false;
     fmPatch((fm) => {
       if (!fm.runInProgress || fm.runInProgress.id !== farm.runId) return;
       const b = fm.byVillage[farm.sourceVid];
@@ -1592,10 +1678,12 @@
           fm._navigateToTt0AfterRun = true;
           fm._endOfRunHandled = true;
           fm._activeRunId = null;
+          runFinished = true;
         }
       }
     });
 
+    // cancel تسک این target خاص
     try {
       const s = window.TC.state();
       const tasks = s.tasks || [];
@@ -1629,7 +1717,8 @@
       fmLog("WARN", "cancel invalid task failed", e);
     }
 
-    if (reportData) {
+    if (runFinished) {
+      cancelOrphanedFarmTasks();
       clearPendingRunKey();
       restoreHeartbeatAfterRun();
       fmLog("INFO", "Run complete (invalid last)", reportData);
@@ -1669,6 +1758,7 @@
       }
     });
 
+    // ⭐ cancel تمام تسک‌های این run
     try {
       const s = window.TC.state();
       const ids = (s.tasks || [])
@@ -1687,6 +1777,7 @@
     }
 
     if (reportData) {
+      cancelOrphanedFarmTasks();
       clearPendingRunKey();
       restoreHeartbeatAfterRun();
       fmLog("WARN", "Run paused (out of troops)", reportData);
@@ -3550,6 +3641,8 @@
       const pendingKey = sessionStorage.getItem(PENDING_RUN_KEY);
       lines.push(`pendingKey=${pendingKey ? "YES" : "no"}`);
       lines.push(`heartbeatWasEnabled=${fm._heartbeatWasEnabled}`);
+      lines.push(`endOfRunHandled=${fm._endOfRunHandled}`);
+      lines.push(`activeRunId=${fm._activeRunId || "null"}`);
       diagEl.innerHTML = lines.map((l) => esc(l)).join("<br>");
     }
 
@@ -3758,6 +3851,9 @@
 
       makeBackup("before-run");
 
+      // ⭐ پاک‌سازی تسک‌های orphaned قبل از شروع
+      cancelOrphanedFarmTasks();
+
       let candidates = l.targets.filter(
         (t) => t.selected !== false && t.invalid !== true,
       );
@@ -3889,11 +3985,15 @@
         fm._activeRunId = runId;
       });
 
-      // ⭐ nextRotationAt پویا: 60s per task + 2min
-      const rotationEstimate =
-        targets.length * ROTATION_PER_TASK_MS + ROTATION_EXTRA_MS;
+      // ⭐ nextRotationAt با سقف امن
+      const rotationEstimate = Math.min(
+        targets.length * ROTATION_PER_TASK_MS + ROTATION_EXTRA_MS,
+        ROTATION_MAX_MS,
+      );
       window.TC.patch((s) => {
-        s.heartbeat.nextRotationAt = now() + rotationEstimate;
+        if (s.heartbeat) {
+          s.heartbeat.nextRotationAt = safeRotationAt(now() + rotationEstimate);
+        }
       });
       fmLog(
         "INFO",
@@ -3934,15 +4034,15 @@
   }
 
   // ─────────────────────────────────────────────────────────────
-  // Enqueue / resume — v1.8.0 با TTL پویا
+  // Enqueue / resume — v1.8.3
   // ─────────────────────────────────────────────────────────────
   function enqueueRunTasks(runData) {
     let count = 0;
 
-    // ⭐ TTL پویا: 45s per task، حداقل 15 دقیقه
-    const dynamicTtl = Math.max(
-      TTL_MIN_MS,
-      runData.listSnapshot.length * TTL_PER_TASK_MS,
+    // ⭐ TTL پویا با سقف
+    const dynamicTtl = Math.min(
+      Math.max(TTL_MIN_MS, runData.listSnapshot.length * TTL_PER_TASK_MS),
+      ROTATION_MAX_MS,
     );
     const ttlMin = Math.round(dynamicTtl / 60000);
     fmLog(
@@ -3990,7 +4090,7 @@
             autoFill: runData.autoFill,
           },
         },
-        ttlMs: dynamicTtl, // ⭐ پویا
+        ttlMs: dynamicTtl,
       });
       if (res) count++;
     }
@@ -4000,10 +4100,12 @@
     window.TC.log?.("farm", `enqueued ${count} tasks (TTL ${ttlMin}min)`);
     fmLog("INFO", `enqueued ${count} tasks, TTL=${ttlMin}min`);
     window.TC.patch((s) => {
-      s.heartbeat.nextRotationAt = Math.max(
-        s.heartbeat.nextRotationAt || 0,
-        now() + dynamicTtl,
-      );
+      if (s.heartbeat) {
+        const target = now() + dynamicTtl;
+        s.heartbeat.nextRotationAt = safeRotationAt(
+          Math.max(s.heartbeat.nextRotationAt || 0, target),
+        );
+      }
     });
   }
 
@@ -4015,6 +4117,8 @@
         "resumeRunIfPending: endOfRunHandled=true → clearing pending & skip",
       );
       clearPendingRunKey();
+      // ⭐ پاک‌سازی تسک‌های orphaned
+      cancelOrphanedFarmTasks();
       return;
     }
     if (fmNow.runInProgress) {
@@ -4185,21 +4289,29 @@
   async function handleFarmArrive({ job, target, payload }) {
     const farm = payload.farm;
     if (!farm) return { type: "fail", reason: "no-farm-payload" };
-    if (!isFarmRunActive(farm.runId))
-      return { type: "done", reason: "run-paused-or-replaced" };
+
+    // ⭐⭐⭐ مهم‌ترین fix: اگر run تمام شده، این task را cancel کن
+    // و به tt=0 navigate کن، نه اینکه در صفحه Send Troops گیر کنی
+    const fmGuard = fmState();
+    if (fmGuard._endOfRunHandled || !isFarmRunActive(farm.runId)) {
+      fmLog(
+        "INFO",
+        `handleFarmArrive: run ended → cancelling orphaned task ${farm.targetName}`,
+      );
+      // ⭐ تمام تسک‌های farm باقی‌مانده را cancel کن
+      cancelOrphanedFarmTasks();
+      // ⭐ به tt=0 برو تا گزارش نهایی نمایش داده شود
+      if (fmGuard._navigateToTt0AfterRun || fmGuard._pendingFinalReport) {
+        try {
+          location.href = `/build.php?id=39&gid=16&tt=0&newdid=${farm.sourceVid}`;
+        } catch (e) {}
+      }
+      return { type: "done", reason: "end-of-run-cleanup" };
+    }
 
     const u = new URL(location.href);
     const isRallySend =
       u.searchParams.get("gid") === "16" && u.searchParams.get("tt") === "2";
-
-    const fmGuard = fmState();
-    if (fmGuard._endOfRunHandled) {
-      fmLog(
-        "WARN",
-        `handleFarmArrive: endOfRunHandled=true → ignoring task ${farm.targetName}`,
-      );
-      return { type: "done", reason: "end-of-run-guard" };
-    }
 
     if (isCooldownActive()) {
       return { type: "wait", delayMs: 500, reason: "cool-down-active" };
@@ -4294,10 +4406,11 @@
       fmLog("INFO", "confirm clicked: " + farm.targetName);
 
       window.TC.patch((s) => {
-        s.heartbeat.nextRotationAt = Math.max(
-          s.heartbeat.nextRotationAt || 0,
-          now() + 5 * 60 * 1000,
-        );
+        if (s.heartbeat) {
+          s.heartbeat.nextRotationAt = safeRotationAt(
+            Math.max(s.heartbeat.nextRotationAt || 0, now() + 5 * 60 * 1000),
+          );
+        }
       });
 
       const fmAfter = fmState();
@@ -4503,6 +4616,7 @@
         <span data-fm-action="clearlog" style="cursor:pointer;padding:2px 6px;background:rgba(200,140,60,.30);border-radius:3px;">🗑 clear log</span>
         <span data-fm-action="clear-run" style="cursor:pointer;padding:2px 6px;background:rgba(200,64,48,.30);border-radius:3px;">clear run</span>
         <span data-fm-action="cancel-tasks" style="cursor:pointer;padding:2px 6px;background:rgba(200,64,48,.30);border-radius:3px;">cancel tasks</span>
+        <span data-fm-action="cancel-orphaned" style="cursor:pointer;padding:2px 6px;background:rgba(200,64,48,.30);border-radius:3px;">cancel orphaned</span>
         <span data-fm-action="reset-rot" style="cursor:pointer;padding:2px 6px;background:rgba(120,90,180,.30);border-radius:3px;">reset rotation</span>
         <span data-fm-action="clear-cd" style="cursor:pointer;padding:2px 6px;background:rgba(200,140,60,.30);border-radius:3px;">clear cooldown</span>
         <span data-fm-action="clear-pending" style="cursor:pointer;padding:2px 6px;background:rgba(200,64,48,.30);border-radius:3px;">clear pending key</span>
@@ -4537,9 +4651,12 @@
         } else if (act === "cancel-tasks") {
           cancelCurrentRun();
           window.TC.flash?.("tasks cancelled");
+        } else if (act === "cancel-orphaned") {
+          const n = cancelOrphanedFarmTasks();
+          window.TC.flash?.(`cancelled ${n} orphaned`);
         } else if (act === "reset-rot") {
           window.TC.patch((s) => {
-            s.heartbeat.nextRotationAt = now() + 5000;
+            if (s.heartbeat) s.heartbeat.nextRotationAt = now() + 5000;
           });
           window.TC.flash?.("rotation reset");
         } else if (act === "clear-cd") {
@@ -4671,6 +4788,17 @@
     installFreezeOverride(TC);
     registerFarmDebugTab(TC);
 
+    // ⭐ پاک‌سازی تسک‌های orphaned در boot
+    setTimeout(() => {
+      const fmNow = fmState();
+      if (fmNow._endOfRunHandled || !fmNow.runInProgress) {
+        const n = cancelOrphanedFarmTasks();
+        if (n > 0) {
+          fmLog("INFO", `Boot cleanup: cancelled ${n} orphaned farm tasks`);
+        }
+      }
+    }, 3000);
+
     window.FM = {
       version: FM_VERSION,
       state: fmState,
@@ -4723,6 +4851,7 @@
       },
       clearPendingRunKey: clearPendingRunKey,
       restoreHbNow: restoreHeartbeatAfterRun,
+      cancelOrphaned: cancelOrphanedFarmTasks,
       forceNavigateTt0: () => {
         const fm = fmState();
         let sid =
