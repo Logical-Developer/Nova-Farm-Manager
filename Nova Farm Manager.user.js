@@ -1179,7 +1179,7 @@
     const overlay = document.createElement("div");
     overlay.id = "fm-cooldown-overlay";
     overlay.style.cssText =
-      "position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:20px;";
+      "position:fixed;top:190px;left:8px;right:8px;z-index:2147483647;display:flex;align-items:flex-start;justify-content:center;padding:0;pointer-events:none;";
 
     const run = fmState().runInProgress;
     const total = run?.planned || 0;
@@ -1188,7 +1188,7 @@
     const pct = total ? Math.round((done / total) * 100) : 0;
 
     const modal = document.createElement("div");
-    modal.style.cssText = `background:linear-gradient(180deg,#f9fbff,#e8eff9);border:2px solid #8a9ac0;border-radius:10px;padding:20px;font-family:Verdana,sans-serif;font-size:13px;color:#1a2050;max-width:440px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,.55);text-align:center;`;
+    modal.style.cssText = `background:linear-gradient(180deg,#f9fbff,#e8eff9);border:2px solid #8a9ac0;border-radius:10px;padding:20px;font-family:Verdana,sans-serif;font-size:13px;color:#1a2050;max-width:440px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,.35);text-align:center;pointer-events:none;`;
     modal.innerHTML = `
       <div style="font-weight:bold;font-size:16px;color:#2a4a70;margin-bottom:4px;">⏸ Cool Down</div>
       <div style="font-size:10px;color:#6a7a98;margin-bottom:14px;">List: ${esc(listName || "-")} · v${FM_VERSION}</div>
@@ -1209,7 +1209,7 @@
           Progress: <b>${done}/${total}</b> (${pct}%) · Remaining: <b>${remaining}</b>
         </div>
       </div>
-      <button type="button" id="fm-cd-cancel" style="padding:8px 20px;background:linear-gradient(180deg,#d04a30,#a03020);color:#fff;border:1px solid #601010;border-radius:5px;font-weight:bold;cursor:pointer;font-size:13px;">⏹ Cancel Raid</button>
+      <button type="button" id="fm-cd-cancel" style="padding:8px 20px;background:linear-gradient(180deg,#d04a30,#a03020);color:#fff;border:1px solid #601010;border-radius:5px;font-weight:bold;cursor:pointer;font-size:13px;pointer-events:auto;">⏹ Cancel Raid</button>
     `;
     overlay.appendChild(modal);
     document.body.appendChild(overlay);
@@ -2317,86 +2317,34 @@
   }
 
   function renderRallyRunStatus() {
-    const onRally = isRallyManagement() || isRallyOverview() || isRallySend();
     let panel = document.getElementById("fm-run-status");
-    if (!onRally) {
+    const run = fmState().runInProgress;
+    if (!isRallySend() || !run) {
       if (panel) panel.remove();
       return;
     }
-    const anchor = document.getElementById("stockBar");
-    if (!anchor) return;
     if (!panel) {
       panel = document.createElement("div");
       panel.id = "fm-run-status";
       panel.style.cssText =
-        "margin:6px 0;padding:8px 10px;background:linear-gradient(180deg,#f9fbff,#e8eff9);border:2px solid #8a9ac0;border-radius:6px;font-family:Verdana,sans-serif;font-size:12px;color:#1a2050;box-shadow:0 3px 10px rgba(0,0,0,.18);box-sizing:border-box;";
-      anchor.insertAdjacentElement("afterend", panel);
-    } else if (panel.previousElementSibling !== anchor) {
-      anchor.insertAdjacentElement("afterend", panel);
+        "position:fixed;top:108px;left:8px;right:8px;z-index:2147483647;margin:0 auto;max-width:900px;padding:8px 10px;background:linear-gradient(180deg,rgba(249,251,255,.98),rgba(232,239,249,.98));border:2px solid #8a9ac0;border-radius:6px;font-family:Verdana,sans-serif;font-size:12px;color:#1a2050;box-shadow:0 3px 10px rgba(0,0,0,.25);box-sizing:border-box;pointer-events:none;";
+      document.body.appendChild(panel);
     }
 
     const vid = String(window.TC.village() || "");
-    const fm = fmState();
-    const run = fm.runInProgress?.sourceVid === vid ? fm.runInProgress : null;
-    const bucket = fm.byVillage[vid];
-    const paused = (bucket?.lists || []).filter(
-      (list) => list.pausedRun && (!run || list.id !== run.listId),
-    );
-    if (!run && !paused.length) {
+    if (run.sourceVid !== vid) {
       panel.remove();
       return;
     }
-
-    if (run) {
-      const total = Math.max(
-        run.planned || 0,
-        (run.resumeTargetIds || []).length,
-      );
-      const done = (run.sent || 0) + (run.failed || 0) + (run.skipped || 0);
-      const remaining = Math.max(0, total - done);
-      const percent = total
-        ? Math.min(100, Math.round((done / total) * 100))
-        : 0;
-      panel.innerHTML = `<div style="display:flex;align-items:center;gap:12px;"><div style="flex:1;min-width:0;"><div style="font-weight:bold;margin-bottom:3px;">${esc(run.listName)} · ${done}/${total} attacks · ${remaining} remaining</div><div style="height:7px;background:#d0d8e8;border-radius:4px;overflow:hidden;"><div style="width:${percent}%;height:100%;background:linear-gradient(90deg,#7ab04a,#4a7a30);transition:width .3s;"></div></div><div style="font-size:10px;color:#5a6a80;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(run.currentTarget || "Preparing next attack")} · ${run.sent || 0} sent, ${run.failed || 0} failed, ${run.skipped || 0} skipped</div></div><button type="button" class="fm-run-stop" style="flex-shrink:0;padding:8px 14px;background:linear-gradient(180deg,#d04a30,#a03020);color:#fff;border:1px solid #601010;border-radius:5px;font-weight:bold;cursor:pointer;">Stop</button></div>`;
-      panel.querySelector(".fm-run-stop").onclick = pauseActiveRun;
-    }
-
-    if (!paused.length) return;
-    const pausedMarkup =
-      `<div style="font-weight:bold;margin:8px 0 5px;color:#805020;border-top:1px solid rgba(80,110,150,.25);padding-top:7px;">Paused farm lists (${paused.length})</div>` +
-      paused
-        .map((list) => {
-          const saved = list.pausedRun;
-          const targetIds = new Set(saved.targetIds || []);
-          const scoped = list.targets.filter((target) =>
-            targetIds.has(target.id),
-          );
-          const remaining = scoped.filter(
-            (target) => target.status !== "sent" && target.invalid !== true,
-          ).length;
-          const done = scoped.filter((target) =>
-            ["sent", "failed", "skipped"].includes(target.status),
-          ).length;
-          const total = Math.max(saved.planned || 0, scoped.length);
-          const percent = total
-            ? Math.min(100, Math.round((done / total) * 100))
-            : 0;
-          return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-top:1px solid rgba(80,110,150,.25);"><div style="flex:1;min-width:0;"><div style="font-weight:bold;">${esc(list.name)} · ${done}/${total} attacks · ${remaining} remaining</div><div style="height:5px;background:#d0d8e8;border-radius:3px;overflow:hidden;margin-top:4px;"><div style="width:${percent}%;height:100%;background:#7ab04a;"></div></div></div><button type="button" data-fm-resume-list="${esc(list.id)}" ${run ? "disabled" : ""} style="flex-shrink:0;padding:7px 12px;background:linear-gradient(180deg,#d09030,#a06020);color:#fff;border:1px solid #603010;border-radius:4px;font-weight:bold;cursor:${run ? "not-allowed" : "pointer"};opacity:${run ? ".55" : "1"};">Resume</button></div>`;
-        })
-        .join("");
-    if (run) panel.insertAdjacentHTML("beforeend", pausedMarkup);
-    else panel.innerHTML = pausedMarkup;
-    panel.querySelectorAll("[data-fm-resume-list]").forEach((button) => {
-      button.onclick = () => {
-        const farmPanel = document.querySelector(".fm-panel");
-        const tab = Array.from(
-          farmPanel?.querySelectorAll(".fm-tab") || [],
-        ).find((item) => item.dataset.id === button.dataset.fmResumeList);
-        if (!tab) return;
-        tab.click();
-        farmPanel.querySelector(".fm-btn-resume")?.click();
-      };
-    });
+    const total = Math.max(
+      run.planned || 0,
+      (run.resumeTargetIds || []).length,
+    );
+    const done = (run.sent || 0) + (run.failed || 0) + (run.skipped || 0);
+    const remaining = Math.max(0, total - done);
+    const percent = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
+    panel.innerHTML = `<div style="display:flex;align-items:center;gap:12px;"><div style="flex:1;min-width:0;"><div style="font-weight:bold;margin-bottom:3px;">${esc(run.listName)} · ${done}/${total} attacks · ${remaining} remaining</div><div style="height:7px;background:#d0d8e8;border-radius:4px;overflow:hidden;"><div style="width:${percent}%;height:100%;background:linear-gradient(90deg,#7ab04a,#4a7a30);transition:width .3s;"></div></div><div style="font-size:10px;color:#5a6a80;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(run.currentTarget || "Preparing next attack")} · ${run.sent || 0} sent, ${run.failed || 0} failed, ${run.skipped || 0} skipped</div></div><button type="button" class="fm-run-stop" style="flex-shrink:0;padding:8px 14px;background:linear-gradient(180deg,#d04a30,#a03020);color:#fff;border:1px solid #601010;border-radius:5px;font-weight:bold;cursor:pointer;pointer-events:auto;">Stop</button></div>`;
+    panel.querySelector(".fm-run-stop").onclick = pauseActiveRun;
   }
 
   function pauseActiveRun() {
@@ -2437,8 +2385,7 @@
       "INFO",
       `Run paused manually: ${run.listName}, target=${currentTargetId || "none"}`,
     );
-    const url = `/build.php?id=39&gid=16&tt=0&newdid=${run.sourceVid}`;
-    location.replace(url);
+    location.replace("/build.php?id=39&gid=16&tt=0");
   }
 
   function openEditTargetDialog(srcVid, listId, targetId, onSave) {
@@ -2918,6 +2865,7 @@
         <button class="fm-btn fm-btn-copylog" title="Copy full log + state + diag" style="margin-left:auto;padding:2px 8px;background:linear-gradient(180deg,#a0c0e0,#6080b0);color:#fff;border:1px solid #4060a0;border-radius:3px;cursor:pointer;font-size:10px;">📋 Copy Log</button>
         <button class="fm-btn fm-btn-clearlog" title="Clear FM log buffer" style="padding:2px 8px;background:linear-gradient(180deg,#f0c0a0,#d09070);color:#fff;border:1px solid #a06040;border-radius:3px;cursor:pointer;font-size:10px;">🗑 Clear Log</button>
       </div>
+      <div class="fm-paused-run-notice" style="display:none;margin-bottom:8px;padding:7px 9px;background:rgba(255,220,170,.45);border:1px solid #d09030;border-radius:4px;"></div>
       <div class="fm-tabs" style="display:flex;gap:4px;margin-bottom:8px;flex-wrap:wrap;"></div>
       <div class="fm-list-toolbar" style="display:flex;gap:6px;margin-bottom:8px;align-items:center;flex-wrap:wrap;">
         <button class="fm-btn fm-btn-new" style="padding:3px 8px;background:linear-gradient(180deg,#7ab04a,#4a7a30);color:#fff;border:1px solid #2a5a10;border-radius:3px;cursor:pointer;font-weight:bold;">+ New List</button>
@@ -2982,6 +2930,7 @@
     const troopEditor = wrap.querySelector(".fm-troop-editor");
     const targetsWrap = wrap.querySelector(".fm-targets-wrap");
     const listActionSummary = wrap.querySelector(".fm-list-action-summary");
+    const pausedRunNotice = wrap.querySelector(".fm-paused-run-notice");
     const selInfoEl = wrap.querySelector(".fm-selected-info");
     const progressEl = wrap.querySelector(".fm-progress");
     const diagEl = wrap.querySelector(".fm-diag");
@@ -3043,6 +2992,50 @@
         return (a.addedAt || 0) - (b.addedAt || 0);
       });
       return arr;
+    }
+
+    function renderPausedRunNotice() {
+      const paused = getBucket().lists.filter((list) => list.pausedRun);
+      if (!paused.length) {
+        pausedRunNotice.style.display = "none";
+        pausedRunNotice.innerHTML = "";
+        return;
+      }
+      pausedRunNotice.style.display = "block";
+      pausedRunNotice.innerHTML =
+        '<div style="font-weight:bold;color:#805020;margin-bottom:5px;">One or more farm tasks were stopped</div>' +
+        paused
+          .map((list) => {
+            const targetIds = new Set(list.pausedRun.targetIds || []);
+            const targets = list.targets.filter((target) =>
+              targetIds.has(target.id),
+            );
+            const remaining = targets.filter(
+              (target) => target.status !== "sent" && target.invalid !== true,
+            ).length;
+            const total = Math.max(list.pausedRun.planned || 0, targets.length);
+            return `<div style="display:flex;align-items:center;gap:8px;padding:3px 0;"><span style="flex:1;min-width:0;">${esc(list.name)} · ${total - remaining}/${total} completed · ${remaining} remaining</span><button type="button" data-fm-resume-paused="${esc(list.id)}" style="padding:4px 9px;background:linear-gradient(180deg,#d09030,#a06020);color:#fff;border:1px solid #603010;border-radius:3px;font-weight:bold;cursor:pointer;">Resume</button></div>`;
+          })
+          .join("");
+      pausedRunNotice
+        .querySelectorAll("[data-fm-resume-paused]")
+        .forEach((button) => {
+          button.onclick = () => {
+            const listId = button.dataset.fmResumePaused;
+            if (
+              listId !== activeListId &&
+              troopEditor.classList.contains("fm-template-dirty") &&
+              !confirm("Discard unsaved template changes?")
+            )
+              return;
+            activeListId = listId;
+            fmPatch((fm) => {
+              fm.byVillage[String(srcVid)].activeListId = listId;
+            });
+            renderAll();
+            startRun("resume");
+          };
+        });
     }
 
     btnCopyLog.onclick = () => copyFullLog();
@@ -3539,6 +3532,7 @@
     }
 
     function renderAll() {
+      renderPausedRunNotice();
       renderTabs();
       renderTroopEditor();
       renderTargets();
@@ -3823,14 +3817,25 @@
       }
 
       const runId = pausedRun?.runId || uid("run");
+      const resumeIds = new Set(resumeTargetIds);
+      const previouslySent = pausedRun
+        ? l.targets.filter(
+            (target) =>
+              resumeIds.has(target.id) &&
+              target.status === "sent" &&
+              target.lastRaid &&
+              target.lastRaid.at >= (pausedRun.startedAt || 0) &&
+              (!target.lastRaid.runId || target.lastRaid.runId === runId),
+          ).length
+        : 0;
       const runData = {
         id: runId,
         sourceVid: String(srcVid),
         listId: l.id,
         listName: l.name,
         startedAt: pausedRun?.startedAt || now(),
-        planned: targets.length,
-        sent: 0,
+        planned: targets.length + previouslySent,
+        sent: previouslySent,
         failed: 0,
         skipped: 0,
         targetIds: targets.map((t) => t.id),
