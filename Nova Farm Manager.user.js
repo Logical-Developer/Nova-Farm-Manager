@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Nova Farm Manager (1.8.1)
+// @name         Nova Farm Manager (1.8.2)
 // @namespace    local.travian.nova.farmmanager
-// @version      1.8.1
+// @version      1.8.2
 // @description  Farm Manager plugin for Nova-HB — dynamic TTL for large runs
 // @match        https://*.travian.com/*
 // @match        https://*.traviantop.com/*
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const FM_VERSION = "1.8.1";
+  const FM_VERSION = "1.8.2";
   const FM_NS = "FarmManager";
   const DRIVER_PLUGIN = "Heartbeat";
   const POLL_MS = 1000;
@@ -1719,7 +1719,7 @@
       return;
     }
 
-    if (isRallySend() && fm._navigateToTt0AfterRun) {
+    if (isRallySend() && fm._navigateToTt0AfterRun && !detectConfirmForm()) {
       let sid = null;
       if (fm._pendingFinalReport?.sourceVid)
         sid = fm._pendingFinalReport.sourceVid;
@@ -4282,6 +4282,12 @@
       if (!confirmBtn)
         return { type: "wait", delayMs: 500, reason: "no-confirm-btn" };
 
+      const clickResult = await humanClickNoNav(confirmBtn, () =>
+        isFarmRunActive(farm.runId),
+      );
+      if (!clickResult.ok)
+        return { type: "done", reason: "run-paused-before-confirm" };
+
       const report = applyResultAndMaybeFinish(farm, "sent", null, {
         submittedAt: now(),
       });
@@ -4294,21 +4300,9 @@
         );
       });
 
-      const clickResult = await humanClickNoNav(
-        confirmBtn,
-        () =>
-          isFarmRunActive(farm.runId) ||
-          (!!report && !!fmState()._pendingFinalReport),
-      );
-      if (!clickResult.ok)
-        return { type: "done", reason: "run-paused-before-confirm" };
-
       const fmAfter = fmState();
       if (fmAfter._navigateToTt0AfterRun || report || !fmAfter.runInProgress) {
         fmLog("INFO", "Run finished after last confirm — navigating to tt=0");
-        try {
-          location.href = `/build.php?id=39&gid=16&tt=0&newdid=${farm.sourceVid}`;
-        } catch (e) {}
         return { type: "done", reason: "confirmed-and-finished" };
       }
       return { type: "done", reason: "confirmed" };
