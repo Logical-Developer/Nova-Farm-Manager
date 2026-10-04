@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Nova Farm Manager (1.8.0)
+// @name         Nova Farm Manager (1.8.1)
 // @namespace    local.travian.nova.farmmanager
-// @version      1.8.0
+// @version      1.8.1
 // @description  Farm Manager plugin for Nova-HB — dynamic TTL for large runs
 // @match        https://*.travian.com/*
 // @match        https://*.traviantop.com/*
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const FM_VERSION = "1.8.0";
+  const FM_VERSION = "1.8.1";
   const FM_NS = "FarmManager";
   const DRIVER_PLUGIN = "Heartbeat";
   const POLL_MS = 1000;
@@ -3014,7 +3014,7 @@
               (target) => target.status !== "sent" && target.invalid !== true,
             ).length;
             const total = Math.max(list.pausedRun.planned || 0, targets.length);
-            return `<div style="display:flex;align-items:center;gap:8px;padding:3px 0;"><span style="flex:1;min-width:0;">${esc(list.name)} · ${total - remaining}/${total} completed · ${remaining} remaining</span><button type="button" data-fm-resume-paused="${esc(list.id)}" style="padding:4px 9px;background:linear-gradient(180deg,#d09030,#a06020);color:#fff;border:1px solid #603010;border-radius:3px;font-weight:bold;cursor:pointer;">Resume</button></div>`;
+            return `<div style="display:flex;align-items:center;gap:8px;padding:3px 0;"><span style="flex:1;min-width:0;">${esc(list.name)} · ${total - remaining}/${total} completed · ${remaining} remaining</span><button type="button" data-fm-resume-paused="${esc(list.id)}" style="padding:4px 9px;background:linear-gradient(180deg,#d09030,#a06020);color:#fff;border:1px solid #603010;border-radius:3px;font-weight:bold;cursor:pointer;">Resume</button><button type="button" data-fm-cancel-paused="${esc(list.id)}" title="Cancel resume" aria-label="Cancel resume" style="width:26px;height:26px;padding:0;background:#f0d0c0;color:#8a2010;border:1px solid #b07050;border-radius:3px;font-size:18px;line-height:1;cursor:pointer;">×</button></div>`;
           })
           .join("");
       pausedRunNotice
@@ -3034,6 +3034,28 @@
             });
             renderAll();
             startRun("resume");
+          };
+        });
+      pausedRunNotice
+        .querySelectorAll("[data-fm-cancel-paused]")
+        .forEach((button) => {
+          button.onclick = () => {
+            const listId = button.dataset.fmCancelPaused;
+            const list = getBucket().lists.find((item) => item.id === listId);
+            if (!list) return;
+            if (
+              !confirm(
+                `Cancel the saved continuation for "${list.name}"? Use Restart All to send the list again from the beginning.`,
+              )
+            )
+              return;
+            fmPatch((fm) => {
+              const targetList = fm.byVillage[String(srcVid)].lists.find(
+                (item) => item.id === listId,
+              );
+              if (targetList) targetList.pausedRun = null;
+            });
+            renderAll();
           };
         });
     }
@@ -3458,7 +3480,7 @@
       if (hasPending) {
         btnStart.style.display = hasDone || hasPausedRun ? "none" : "block";
         btnResume.style.display = hasDone || hasPausedRun ? "block" : "none";
-        btnRestart.style.display = hasDone ? "block" : "none";
+        btnRestart.style.display = hasDone || hasPausedRun ? "block" : "none";
         btnStart.textContent = `Start Raid (${selected.length})`;
         btnResume.textContent = `Resume (${selected.length} remaining)`;
       } else if (l.targets.length > 0) {
@@ -3614,11 +3636,13 @@
         const ll = fm.byVillage[String(srcVid)].lists.find(
           (x) => x.id === l.id,
         );
-        if (ll)
+        if (ll) {
+          ll.pausedRun = null;
           ll.targets.forEach((t) => {
             t.selected = true;
             t.invalid = false;
           });
+        }
       });
       renderTargets();
       renderRunbar();
@@ -4150,10 +4174,18 @@
     return false;
   }
 
+  function isFarmRunActive(runId) {
+    const fm = fmState();
+    return (
+      fm._endOfRunHandled !== true &&
+      (!fm._activeRunId || fm._activeRunId === runId)
+    );
+  }
+
   async function handleFarmArrive({ job, target, payload }) {
     const farm = payload.farm;
     if (!farm) return { type: "fail", reason: "no-farm-payload" };
-    if (fmState().runInProgress?.id !== farm.runId)
+    if (!isFarmRunActive(farm.runId))
       return { type: "done", reason: "run-paused-or-replaced" };
 
     const u = new URL(location.href);
@@ -4236,7 +4268,7 @@
     }
 
     fmPatch((fm) => {
-      if (fm.runInProgress) {
+      if (fm.runInProgress?.id === farm.runId) {
         fm.runInProgress.currentTarget = farm.targetName;
         fm.runInProgress.currentTargetId = farm.targetId;
         fm.runInProgress.currentState = "filling";
@@ -4244,7 +4276,7 @@
     });
 
     if (confirmFormExists) {
-      if (fmState().runInProgress?.id !== farm.runId)
+      if (!isFarmRunActive(farm.runId))
         return { type: "done", reason: "run-paused-before-confirm" };
       const confirmBtn = document.getElementById("confirmSendTroops");
       if (!confirmBtn)
@@ -4265,7 +4297,7 @@
       const clickResult = await humanClickNoNav(
         confirmBtn,
         () =>
-          fmState().runInProgress?.id === farm.runId ||
+          isFarmRunActive(farm.runId) ||
           (!!report && !!fmState()._pendingFinalReport),
       );
       if (!clickResult.ok)
@@ -4325,7 +4357,7 @@
       if (!inp || inp.disabled) continue;
       await humanType(inp, String(plan.troops[k] | 0));
       await humanTabToNext(inp);
-      if (fmState().runInProgress?.id !== farm.runId)
+      if (!isFarmRunActive(farm.runId))
         return { type: "done", reason: "run-paused-while-filling" };
     }
 
@@ -4342,7 +4374,7 @@
     if (!raidRadio.checked) await humanClickNoNav(raidRadio);
 
     await delay(logNormal(200, 500));
-    if (fmState().runInProgress?.id !== farm.runId)
+    if (!isFarmRunActive(farm.runId))
       return { type: "done", reason: "run-paused-before-submit" };
     if (
       parseInt(xInp.value, 10) !== farm.x ||
@@ -4358,9 +4390,8 @@
       if (fm.runInProgress) fm.runInProgress.currentState = "submitting";
     });
     fmLog("INFO", "submitting " + farm.targetName + " → awaiting confirm");
-    const submitResult = await humanClickNoNav(
-      okBtn,
-      () => fmState().runInProgress?.id === farm.runId,
+    const submitResult = await humanClickNoNav(okBtn, () =>
+      isFarmRunActive(farm.runId),
     );
     if (!submitResult.ok)
       return { type: "done", reason: "run-paused-before-submit" };
